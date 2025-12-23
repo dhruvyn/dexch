@@ -4,3 +4,4 @@ __pycache__/
 .env
 .ipynb_checkpoints/
 sample_data/
+results/
