@@ -58,6 +58,7 @@ def corr_heatmap(X) :
     corr_pairs = corr_pairs[corr_pairs < 1.0] # Remove self correlation
 
     # Show top 20
+    print(corr_pairs.head(20))
     return corr_pairs
 # ==========================================
 # HIERARCHICAL CLUSTERING ANALYSIS
@@ -92,7 +93,7 @@ def clustering_analysis(X, threshold=0.5, plot=True) :
         plt.title('Feature Clustering Dendrogram (Ward Linkage)', fontsize=20)
         plt.xlabel('Features')
         plt.ylabel('Distance (1 - |Corr|)')
-        plt.axhline(y=0.5, color='r', linestyle='--', label='Threshold = 0.5 (Corr > 0.5)')
+        plt.axhline(y=threshold, color='r', linestyle='--', label=f'Threshold = {threshold} (Corr > {threshold})')
         plt.legend()
         plt.tight_layout()
         plt.show()
@@ -343,26 +344,26 @@ def visualize_cluster_importance(df_mda, dead_clusters):
     print("\n--- DECISION REPORT ---")
     # 1. Best Cluster
     best_cluster = total_importance.idxmax()
-    print(f"🏆 MVP Cluster: Cluster {best_cluster} (Highest Total Signal)")
+    print(f" MVP Cluster: Cluster {best_cluster} (Highest Total Signal)")
 
     # 2. Worst Clusters (Negative Impact)
     negative_clusters = total_importance[total_importance < 0].index.tolist()
     if negative_clusters:
-        print(f"⚠️  Harmful Clusters (Negative Score - REMOVE THESE): {negative_clusters}")
+        print(f"Harmful Clusters (Negative Score - REMOVE THESE): {negative_clusters}")
     else:
-        print("✅ No clusters were explicitly harmful (all > 0).")
+        print("No clusters were explicitly harmful (all > 0).")
 
     # 3. Useless Clusters (Near Zero)
     # Clusters that add less than 0.0001 total log loss improvement are basically noise.
     useless_clusters = total_importance[(total_importance >= 0) & (total_importance < 1e-4)].index.tolist()
     if useless_clusters:
-        print(f"💤 Weak/Noise Clusters (Near Zero Impact): {useless_clusters}")
+        print(f"Weak/Noise Clusters (Near Zero Impact): {useless_clusters}")
 
     # 4. Dead Clusters (Negative or Zero across all targets)
     if dead_clusters:
-        print(f"💀 Dead Clusters (Negative or Zero across all targets): {dead_clusters}")
+        print(f"Dead Clusters (Negative or Zero across all targets): {dead_clusters}")
     else:
-        print("✅ No clusters were dead (all > 0 across all targets).")
+        print(" No clusters were dead (all > 0 across all targets).")
 
 
 
@@ -378,33 +379,26 @@ if __name__ == "__main__":
         required=True,
         help="Path to X CSV file"
     )
-
     parser.add_argument(
-        "--start_idx",
-        type=int,
+        "--target_path", 
+        default="./sample_data/btc_5min_targets.csv",
+        type=str,
         required=True,
-        help="Start index of the split"
-    )
-
-    parser.add_argument(
-        "--end_idx",
-        type=int,
-        required=True,
-        help="End index of the split"
+        help="Path to target CSV file"
     )
 
     args = parser.parse_args()
 
     # ---- use args ----
     print(f"Loading X from: {args.X_path}")
-    print(f"Split indices: {args.start_idx} → {args.end_idx}")
     
     
-    df_final = pd.read_csv('df_final.csv')
+    df_final = pd.read_csv(args.X_path)
+    
     X = df_final.select_dtypes(include=[np.number])
     print(df_final.head())
 
-    targets= pd.read_csv("./sample_data/btc_5min_targets.csv")
+    targets= pd.read_csv(args.target_path)
 
 
 

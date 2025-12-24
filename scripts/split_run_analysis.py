@@ -5,6 +5,10 @@ import argparse
 import os
 import subprocess
 import sys
+import gc  # <--- ADDED: To force memory cleanup
+from statsmodels.tsa.stattools import adfuller
+from scipy.stats import kurtosis
+
 
 # ==========================================
 # LOGGING UTILITY
@@ -30,6 +34,7 @@ class Logger(object):
 # ==========================================
 # CONFIGURATION: FEATURE BUCKETS
 # ==========================================
+
 bucket_a_cols = [
     'OPEN_PRICE', 'HIGH_PRICE', 'LOW_PRICE', 'CLOSE_PRICE',
     'VWAP', 'AVG_PRICE',
@@ -68,13 +73,91 @@ liq_transform_map = {
     'AVG_LIQUIDATION_PRICE': 'DIST_AVG_LIQ',
     'VWAP_LIQUIDATION_PRICE': 'DIST_VWAP_LIQ'
 }
+TIME_STAMP_NAME ="BAR_TIMESTAMP"
 
 # ==========================================
 # HELPER FUNCTIONS: TRANSFORMATIONS
 # ==========================================
 
+def test_bucket_hypothesis(df, bucket_cols, bucket_name):
+    print(f"\n--- TESTING {bucket_name} ---")
+    results = []
+    
+    for col in bucket_cols:
+        if col not in df.columns:
+            continue
+            
+        series = df[col].dropna()
+        if len(series) < 20: # Skip if empty
+            continue
+            
+        # 1. Stationarity Test (ADF)
+        # Null Hypothesis: Series is Non-Stationary.
+        # p < 0.05 = Rejects Null (It IS Stationary).
+        # p > 0.05 = Fails to Reject (It is Trending/Drifting).
+        try:
+            adf_result = adfuller(series.values, maxlag=1)
+            p_value = adf_result[1]
+        except:
+            p_value = 1.0 # Default fail
+
+        # 2. Heavy Tail Test (Kurtosis)
+        # Normal Distribution = 3.0 (Fisher definition uses 0 as normal, so >0 is heavy)
+        # We use Pearson (Normal = 3). Values > 3 imply "Spiky" outliers.
+        kurt_val = kurtosis(series, fisher=False) 
+
+        # 3. Sparsity (Zero %)
+        zero_pct = (series == 0).mean()
+
+        # --- EVALUATION LOGIC ---
+        status = "PASS"
+        reason = ""
+
+        if bucket_name == "BUCKET_A":
+            # Hypothesis: Should be Non-Stationary (High Memory)
+            if p_value < 0.05: 
+                status = "WARNING"
+                reason = "Already Stationary (Maybe skip FracDiff?)"
+        
+        elif bucket_name == "BUCKET_B":
+            # Hypothesis: Should be Spiky/Heavy Tailed
+            if kurt_val < 3:
+                status = "NOTE"
+                reason = "Low Kurtosis (Not spiky, maybe standard scale?)"
+        
+        elif bucket_name == "BUCKET_C":
+            # Hypothesis: Should be Stationary (Oscillator)
+            # EXCEPTION: Liquidation Prices (MIN/MAX) are technically Prices (Drifting)
+            # until we transform them to Spreads. We check this specifically.
+            if "LIQUIDATION_PRICE" in col:
+                # We expect raw prices to fail stationarity, proving they need transformation
+                if p_value > 0.05:
+                    status = "CONFIRMED"
+                    reason = "Raw Price Drifts (Needs 'Spread' transform)"
+                else:
+                    status = "WEIRD"
+                    reason = "Price is stationary??"
+            elif p_value > 0.05:
+                status = "WARNING"
+                reason = "Non-Stationary (Ratio is drifting!)"
+
+        # Append
+        results.append({
+            "Feature": col,
+            "ADF_p_val": round(p_value, 4),
+            "Kurtosis": round(kurt_val, 1),
+            "Zeros%": round(zero_pct, 2),
+            "Status": status,
+            "Comment": reason
+        })
+    
+    # Print Report
+    report_df = pd.DataFrame(results)
+    print(report_df.to_string())
+
 def transform_liq_prices_update_inplace(df, verbose=True): 
     if verbose: print("--- TRANSFORMING LIQUIDATION PRICES ---")
+    # log(liq) - log(close) -> fillna(0)
 
     for raw_col, new_col in liq_transform_map.items():
         if raw_col in df.columns:
@@ -145,7 +228,7 @@ def bucket_b_process(df, cols, verbose=True, meta_cols=['SYMBOL', 'EXCHANGE', 'B
     for col in valid_cols:
         if verbose: print(f"Processing {col}...")
         
-        # Log1p -> Rolling Robust Scaler
+        # Log1p -> Rolling Robust Scaler, iqr
         df_b[col] = np.log1p(df_b[col])
         
         rolling_median = df_b[col].rolling(window=window).median()
@@ -225,56 +308,168 @@ def run_X_pipeline(df, verbose=True):
     missing_a = [a for a in bucket_a_cols if (a+"_A") not in df_bucket_a.columns]
     missing_b = [b for b in bucket_b_cols if (b+"_B") not in df_bucket_b.columns]
     missing_c = [c for c in bucket_c_cols if (c+"_C") not in df_bucket_c.columns]
-    
+    missing_cols = [v for v in bucket_a_cols + bucket_b_cols + bucket_c_cols if v not in df.columns.tolist()]
+
     assert len(missing_a) == 0, f"Missing A: {missing_a}"
     assert len(missing_b) == 0, f"Missing B: {missing_b}"
     assert len(missing_c) == 0, f"Missing C: {missing_c}"
+    assert len(missing_cols) == 0, f"Missing Columns: {missing_cols}"
 
     df_final = merge_and_clean(df_bucket_a, df_bucket_b, df_bucket_c, verbose)
+
+    print("------- STARTING HYPOTHESIS TESTS -------")
+    # 1. Test Bucket A (Expect High p-values)
+    test_bucket_hypothesis(df_final,[a for a in  df_bucket_a.columns.to_list() if ("BAR_TIMESTAMP" not in a) and ("EXCHANGE" not in a) and ("SYMBOL" not in a)], "BUCKET_A")
+
+    # 2. Test Bucket B (Expect High Kurtosis)
+    test_bucket_hypothesis(df_final, [a for a in  df_bucket_b.columns.to_list() if ("BAR_TIMESTAMP" not in a) and ("EXCHANGE" not in a) and ("SYMBOL" not in a)], "BUCKET_B")
+
+    # 3. Test Bucket C (Expect Low p-values, except for Raw Liq Prices)
+    test_bucket_hypothesis(df_final, [a for a in  df_bucket_c.columns.to_list() if ("BAR_TIMESTAMP" not in a) and ("EXCHANGE" not in a) and ("SYMBOL" not in a)], "BUCKET_C")
+
+
     return df_final
 
 # ==========================================
 # MAIN EXECUTION
 # ==========================================
+DEFAULT_FILE_PATH = "./sample_data/btc_5min_nan_processed_data.csv"
+RUN_FILE = "./scripts/run_analysis_refactor.py"
+DAYS_PER_MONTH = 30
+HOURS_PER_DAY = 24
+MINUTES_PER_HOUR = 60
+MINUTES_PER_ROW = 5
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--folder_name", type=str, required=True, help="Output directory root")
-    parser.add_argument("--num_splits", type=int, required=True, help="Number of splits")
+    parser.add_argument("--output_folder", type=str, required=True, help="Output directory root")
+    parser.add_argument("--num_splits", type=int, default= -1,  help="Number of splits")
+    parser.add_argument("--filepath", type=str, default=DEFAULT_FILE_PATH, help="File path")
+    parser.add_argument("--target_path", default="./sample_data/btc_5min_targets.csv", type=str, help="Path to target CSV file")
+    parser.add_argument("--latest_num_months", default=-1, type=int, help="Number of months to use for latest bucket")
     args = parser.parse_args()
     
-    folder_name = args.folder_name
+    output_folder = args.output_folder
     num_splits = args.num_splits    
+    FILE_PATH = args.filepath
+    num_months = args.latest_num_months
 
     # 1. Setup Main Directory and Logging
-    if not os.path.exists(folder_name):
-        os.makedirs(folder_name)
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
     
-    log_file_path = os.path.join(folder_name, "log.txt")
+    log_file_path = os.path.join(output_folder, "log.txt")
     sys.stdout = Logger(log_file_path)
 
     try:
         # 2. Load Data
         print("Loading Data...")
-        FILE_PATH = "./sample_data/btc_5min_nan_processed_data.csv"
-        df = pd.read_csv(FILE_PATH, parse_dates=["BAR_TIMESTAMP"])
-        df.sort_values(["BAR_TIMESTAMP"], inplace=True)
+        
+        df = pd.read_csv(FILE_PATH, parse_dates=[TIME_STAMP_NAME])
+        df.sort_values([TIME_STAMP_NAME], inplace=True)
         
         # 3. Update Bucket C List (Dynamic handling for liq prices)
         bucket_c_cols = [col for col in bucket_c_cols if col not in liq_transform_map.keys()]
         bucket_c_cols.extend(liq_transform_map.values())
         print(f"Updated Bucket C List: {bucket_c_cols}")
 
-        # 4. Generate Splits
-        indices = np.arange(len(df))
-        splits = np.array_split(indices, num_splits)
 
-        print(f"Starting execution on {num_splits} splits...")
+        # 4. Run Hypothesis Pipeline
+        test_bucket_hypothesis(df, bucket_a_cols, "Bucket A")
+        test_bucket_hypothesis(df, bucket_b_cols, "Bucket B")     
+        test_bucket_hypothesis(df, bucket_c_cols, "Bucket C")
 
-        for i, split in enumerate(splits):
-            split_id = i + 1
+
+
+        # 5. Generate Splits
+        if num_months == -1 :
+            indices = np.arange(len(df))
+            splits = np.array_split(indices, num_splits)
+
+            print(f"Starting execution on {num_splits} splits...")
+
+            for i, split in enumerate(splits):
+                split_id = i + 1
+                print(f"\n{'='*40}")
+                print(f"PROCESSING SPLIT {split_id}/{num_splits}")
+                print(f"{'='*40}")
+
+                # Create copy to avoid SettingWithCopy warnings
+                df_split = df.iloc[split].copy()
+                
+                # A. Inplace Transformation (Liquidation columns)
+                transform_liq_prices_update_inplace(df_split, verbose=True)
+
+                # B. Run Pipeline
+                X = run_X_pipeline(df_split, verbose=True)
+
+                # C. Define Directory Structure: output_folder/split_N/data_split/
+                split_dir = os.path.join(output_folder, f"split_{split_id}")
+                data_split_dir = os.path.join(split_dir, "data_split")
+                
+                if not os.path.exists(data_split_dir):
+                    os.makedirs(data_split_dir)
+
+                # D. Save Processed Split
+                global_start = split[0]
+                global_end = split[-1]
+                X_path = os.path.join(data_split_dir, f"X_{global_start}_{global_end}.csv")
+                
+                print(f"Saving split data to: {X_path}")
+                X.to_csv(X_path, index=False)
+
+                # --- MEMORY CLEANUP BEFORE SUBPROCESS ---
+                print("Cleaning up memory before subprocess...")
+                del X
+                del df_split
+                gc.collect()
+                # ----------------------------------------
+
+                # E. Run Analysis Subprocess
+                print(f"Launching subprocess: {RUN_FILE}")
+
+                # Use Popen to stream output line-by-line
+                with subprocess.Popen(
+                    [
+                        sys.executable,
+                        RUN_FILE,
+                        "--X_path", X_path,
+                        "--split_dir", split_dir,
+                        "--target_path", args.target_path
+                    ],
+                    stdout=subprocess.PIPE,  # Capture stdout
+                    stderr=subprocess.STDOUT, # Redirect stderr to stdout so errors define logged too
+                    text=True,               # Decode to string immediately
+                    bufsize=1                # Line buffering
+                ) as proc:
+                    # Read output line by line as it is generated
+                    for line in proc.stdout:
+                        print(line, end='')  # This triggers your Logger.write() (Terminal + File)
+
+                if proc.returncode != 0:
+                    print(f"Subprocess failed with return code {proc.returncode}")
+                    raise subprocess.CalledProcessError(proc.returncode, RUN_FILE)
+        else:
+            # 1. Calculate number of rows to process
+            rows_to_process = int(num_months * DAYS_PER_MONTH * HOURS_PER_DAY * MINUTES_PER_HOUR / MINUTES_PER_ROW)
+            
+            # Safety check: ensure we don't try to grab more rows than exist
+            if rows_to_process > len(df):
+                print(f"Warning: Requested {num_months} months ({rows_to_process} rows) exceeds data length. Using full dataset.")
+                rows_to_process = len(df)
+
+            # 2. Generate the indices for the LAST 'rows_to_process'
+            start_index = len(df) - rows_to_process
+            split = np.arange(start_index, len(df))
+
+            # Set up identification for this single run
+            split_id = 1 
             print(f"\n{'='*40}")
-            print(f"PROCESSING SPLIT {split_id}/{num_splits}")
+            print(f"PROCESSING LAST {num_months} MONTHS ({rows_to_process} rows)")
             print(f"{'='*40}")
+
+            # --- LOGIC COPIED FROM SPLIT LOOP BELOW ---
 
             # Create copy to avoid SettingWithCopy warnings
             df_split = df.iloc[split].copy()
@@ -284,9 +479,9 @@ if __name__ == "__main__":
 
             # B. Run Pipeline
             X = run_X_pipeline(df_split, verbose=True)
-            
-            # C. Define Directory Structure: folder_name/split_N/data_split/
-            split_dir = os.path.join(folder_name, f"split_{split_id}")
+
+            # C. Define Directory Structure: output_folder/split_recent/data_split/
+            split_dir = os.path.join(output_folder, f"split_recent_{num_months}m")
             data_split_dir = os.path.join(split_dir, "data_split")
             
             if not os.path.exists(data_split_dir):
@@ -300,13 +495,14 @@ if __name__ == "__main__":
             print(f"Saving split data to: {X_path}")
             X.to_csv(X_path, index=False)
 
-            # E. Run Analysis Subprocess
-            # NOTE: subprocess doesn't need start/end args anymore as it reads the full file
-            RUN_FILE = "./scripts/run_analysis_refactor.py"
-            print(f"Launching subprocess: {RUN_FILE}")
-            
-        # ... inside your loop ...
+            # --- MEMORY CLEANUP BEFORE SUBPROCESS ---
+            print("Cleaning up memory before subprocess...")
+            del X
+            del df_split
+            gc.collect()
+            # ----------------------------------------
 
+            # E. Run Analysis Subprocess
             print(f"Launching subprocess: {RUN_FILE}")
 
             # Use Popen to stream output line-by-line
@@ -315,21 +511,22 @@ if __name__ == "__main__":
                     sys.executable,
                     RUN_FILE,
                     "--X_path", X_path,
-                    "--split_dir", split_dir
-                    # Remove start/end indices as discussed
+                    "--split_dir", split_dir,
+                    "--target_path", args.target_path
                 ],
                 stdout=subprocess.PIPE,  # Capture stdout
-                stderr=subprocess.STDOUT, # Redirect stderr to stdout so errors define logged too
+                stderr=subprocess.STDOUT, # Redirect stderr to stdout
                 text=True,               # Decode to string immediately
                 bufsize=1                # Line buffering
             ) as proc:
                 # Read output line by line as it is generated
                 for line in proc.stdout:
-                    print(line, end='')  # This triggers your Logger.write() (Terminal + File)
+                    print(line, end='')  # This triggers your Logger.write()
 
             if proc.returncode != 0:
                 print(f"Subprocess failed with return code {proc.returncode}")
                 raise subprocess.CalledProcessError(proc.returncode, RUN_FILE)
+
                 
     except Exception as e:
         print(f"CRITICAL ERROR: {e}")

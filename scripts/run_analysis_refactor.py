@@ -357,7 +357,8 @@ def visualize_cluster_importance(df_mda, dead_clusters, save_dir=None):
     else:
         print("✅ No clusters were dead (all > 0 across all targets).")
 
-TARGET_FILE_PATH = "./sample_data/btc_5min_targets.csv"
+DEFAULT_TARGET_FILE_PATH = "./sample_data/btc_5min_targets.csv"
+DEFAULT_THRESHOLD_RUNS = [0.5, 0.7]
 
 def setup_directories(parent_dir, threshold):
     """Creates a subdirectory for the specific threshold run."""
@@ -371,22 +372,19 @@ if __name__ == "__main__":
 
     parser.add_argument("--X_path", type=str, required=True, help="Path to X CSV file")
     parser.add_argument("--split_dir", type=str, required=True, help="Base path for analysis dump")
+    parser.add_argument("--target_path", default=DEFAULT_TARGET_FILE_PATH, type=str,required=True, help="Path to target CSV file")
+    parser.add_argument(
+        "--thresholds", 
+        nargs='+',           # Reads one or more arguments into a list
+        type=float,          # Converts each argument to a float
+        default= DEFAULT_THRESHOLD_RUNS,  # Default value 
+        help="List of thresholds (usage: --thresholds 0.3 0.5 0.7)"
+    )
     args = parser.parse_args()
     
     # Define thresholds to iterate over
-    thresholds = [0.1, 0.3, 0.5]
-    
-    # Determine parent directory from input path to store results next to it
-    # Or create a dedicated 'analysis_runs' folder in current working dir
-    base_output_dir = "analysis_runs"
-    if not os.path.exists(base_output_dir):
-        os.makedirs(base_output_dir)
-
-
-    # *** PRINT FULL DUMP PATH HERE ***
-    full_dump_path = os.path.abspath(base_output_dir)
-    print(f"\n>>> GLOBAL DUMP LOCATION: {full_dump_path}")
-    print(f">>> Processing thresholds: {thresholds}\n")
+    thresholds = args.thresholds
+    TARGET_FILE_PATH = args.target_path
 
     # ---------------------------------------------
     # 1. SETUP BASE DIRECTORY
@@ -447,4 +445,3 @@ if __name__ == "__main__":
         sys.stdout = sys.__stdout__
 
     print("\nAll threshold runs completed successfully.")
-    print(f"Final results are located at: {full_dump_path}")
