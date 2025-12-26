@@ -334,7 +334,7 @@ def run_X_pipeline(df, verbose=True):
 # MAIN EXECUTION
 # ==========================================
 DEFAULT_FILE_PATH = "./sample_data/btc_5min_nan_processed_data.csv"
-RUN_FILE = "./scripts/run_analysis_refactor.py"
+RUN_FILE = "./scripts/run_analysis_refactor_p2.py"
 DAYS_PER_MONTH = 30
 HOURS_PER_DAY = 24
 MINUTES_PER_HOUR = 60
@@ -345,19 +345,31 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_folder", type=str, required=True, help="Output directory root")
     parser.add_argument("--num_splits", type=int, default= -1,  help="Number of splits")
+    parser.add_argument("--num_folds", type=int, default= 3,  help="Number of folds")
     parser.add_argument("--filepath", type=str, default=DEFAULT_FILE_PATH, help="File path")
     parser.add_argument("--target_path", default="./sample_data/btc_5min_targets.csv", type=str, help="Path to target CSV file")
     parser.add_argument("--latest_num_months", default=-1, type=int, help="Number of months to use for latest bucket")
+    parser.add_argument("--purge_size", default=24, type=int, help="Number of rows to purge during validation")
+
     args = parser.parse_args()
     
     output_folder = args.output_folder
     num_splits = args.num_splits    
     FILE_PATH = args.filepath
     num_months = args.latest_num_months
+    purge_size = args.purge_size
+    num_folds= args.num_folds
 
     # 1. Setup Main Directory and Logging
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
+
+    # --- NEW: PREPARE ENVIRONMENT TO SILENCE WARNINGS ---
+    # This creates a copy of your OS environment and forces Python 
+    # to ignore warnings in the subprocess.
+    my_env = os.environ.copy()
+    my_env["PYTHONWARNINGS"] = "ignore"
+    # ----------------------------------------------------
     
     log_file_path = os.path.join(output_folder, "log.txt")
     sys.stdout = Logger(log_file_path)
@@ -428,6 +440,7 @@ if __name__ == "__main__":
 
                 # E. Run Analysis Subprocess
                 print(f"Launching subprocess: {RUN_FILE}")
+                print(f"purge_size = {purge_size}")
 
                 # Use Popen to stream output line-by-line
                 with subprocess.Popen(
@@ -436,12 +449,15 @@ if __name__ == "__main__":
                         RUN_FILE,
                         "--X_path", X_path,
                         "--split_dir", split_dir,
-                        "--target_path", args.target_path
+                        "--target_path", args.target_path,
+                        "--purge_size", str(purge_size),
+                        "--num_folds", str(num_folds)
                     ],
                     stdout=subprocess.PIPE,  # Capture stdout
                     stderr=subprocess.STDOUT, # Redirect stderr to stdout so errors define logged too
                     text=True,               # Decode to string immediately
-                    bufsize=1                # Line buffering
+                    bufsize=1,           # Line buffering
+                    env=my_env  # <--- CRITICAL FIX: Pass the modified environment
                 ) as proc:
                     # Read output line by line as it is generated
                     for line in proc.stdout:
@@ -503,8 +519,9 @@ if __name__ == "__main__":
             # ----------------------------------------
 
             # E. Run Analysis Subprocess
-            print(f"Launching subprocess: {RUN_FILE}")
 
+            print(f"Launching subprocess: {RUN_FILE}")
+            print(f"purge_size = {purge_size}")
             # Use Popen to stream output line-by-line
             with subprocess.Popen(
                 [
@@ -512,12 +529,15 @@ if __name__ == "__main__":
                     RUN_FILE,
                     "--X_path", X_path,
                     "--split_dir", split_dir,
-                    "--target_path", args.target_path
+                    "--target_path", args.target_path, 
+                    "--num_folds", str(num_folds) ,
+                    "--purge_size", str(purge_size)
                 ],
                 stdout=subprocess.PIPE,  # Capture stdout
                 stderr=subprocess.STDOUT, # Redirect stderr to stdout
                 text=True,               # Decode to string immediately
-                bufsize=1                # Line buffering
+                bufsize=1,                 # Line buffering
+                env=my_env  # <--- CRITICAL FIX: Pass the modified environment
             ) as proc:
                 # Read output line by line as it is generated
                 for line in proc.stdout:

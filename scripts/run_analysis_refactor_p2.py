@@ -11,7 +11,17 @@ import seaborn as sns
 import argparse
 import os
 import sys
-
+# ==========================================
+# WARNING SUPPRESSION (ADDED)
+# ==========================================
+import warnings
+# Filter specific sklearn parallel warnings to clean up the log
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.utils.parallel")
+warnings.filterwarnings("ignore", category=FutureWarning)
+# --- CRITICAL FIX: FORCE NON-INTERACTIVE BACKEND ---
+import matplotlib
+matplotlib.use('Agg')  # <--- Add this line BEFORE importing pyplot
+# ---------------------------------------------------
 # ==========================================
 # UTILITIES: LOGGING & FILE MANAGEMENT
 # ==========================================
@@ -185,7 +195,40 @@ def verify_data(X_numeric, y_full, feature_to_cluster, verbose=True):
 # ==============================================================================
 # ENGINE: ROBUST CLUSTERED MDA (WALK-FORWARD)
 # ==============================================================================
-def get_robust_clustered_mda(X, y, feature_to_cluster, n_splits=3, purge_size=24):
+
+def block_shuffle(arr, block_size=288):
+    """
+    Shuffles data in blocks to preserve local autocorrelation structure.
+    block_size 288 = 24 hours of 5-min data.
+    """
+    n = len(arr)
+    # If data is too short, just random shuffle
+    if n <= block_size:
+        indices = np.arange(n)
+        np.random.shuffle(indices)
+        return arr[indices] if arr.ndim > 1 else arr[indices]
+    
+    # Create indices
+    indices = np.arange(n)
+    
+    # Split indices into chunks of block_size
+    num_blocks = int(np.ceil(n / block_size))
+    blocks = np.array_split(indices, num_blocks)
+    
+    # Shuffle the list of blocks
+    # Note: We must be careful with np.random.shuffle on a list of numpy arrays, 
+    # so we use permutation on the block indices
+    block_order = np.random.permutation(len(blocks))
+    
+    shuffled_indices = np.concatenate([blocks[i] for i in block_order])
+    
+    # Return re-ordered array (handles 1D or 2D)
+    if arr.ndim == 1:
+        return arr[shuffled_indices]
+    else:
+        return arr[shuffled_indices, :]
+
+def get_robust_clustered_mda(X, y, purge_size, feature_to_cluster, n_splits=3):
     
     # 1. Setup Model (Light RF)
     model_params = {'n_estimators': 150, 'max_depth': 5, 'n_jobs': -1, 'random_state': 42}
@@ -215,7 +258,7 @@ def get_robust_clustered_mda(X, y, feature_to_cluster, n_splits=3, purge_size=24
         base_probs = clf.predict_proba(X_val)
         base_score = log_loss(y_val, base_probs, labels=clf.classes_)
         
-        # --- CLUSTER PERMUTATION ---
+        # --- CLUSTER PERMUTATION (BLOCK SHUFFLED) ---
         fold_importances = {}
         unique_clusters = sorted(list(set(feature_to_cluster.values())))
         
@@ -223,27 +266,60 @@ def get_robust_clustered_mda(X, y, feature_to_cluster, n_splits=3, purge_size=24
             cluster_feats = [f for f, c in feature_to_cluster.items() if c == cid and f in X.columns]
             if not cluster_feats: continue
             
-            # Shuffle
+            # Create copy for shuffling
             X_val_shuffled = X_val.copy()
-            shuffled_vals = X_val[cluster_feats].values.copy()
-            np.random.shuffle(shuffled_vals)
-            X_val_shuffled[cluster_feats] = shuffled_vals
+            
+            # Extract cluster data (2D array)
+            cluster_data = X_val[cluster_feats].values
+            
+            # BLOCK SHUFFLE: Shuffles rows of this cluster, preserving row-wise correlations
+            # but breaking time-alignment with Target
+            shuffled_cluster_data = block_shuffle(cluster_data, block_size=288)
+            
+            # Assign back
+            X_val_shuffled[cluster_feats] = shuffled_cluster_data
             
             # Score Drop
             shuffled_probs = clf.predict_proba(X_val_shuffled)
             shuffled_score = log_loss(y_val, shuffled_probs, labels=clf.classes_)
             
+            # Save Raw Delta
             fold_importances[cid] = shuffled_score - base_score
             
         fold_scores.append(fold_importances)
         print(f"  Fold {fold_idx+1} Base Loss: {base_score:.4f}")
 
-    return pd.DataFrame(fold_scores).mean().to_dict()
+    # =========================================================
+    # STABILITY ANALYSIS (SHARPE RATIO)
+    # =========================================================
+    df_scores = pd.DataFrame(fold_scores)
+    
+    # Calculate Metrics
+    means = df_scores.mean()
+    stds = df_scores.std()
+    
+    # Sharpe = Mean / Std (with epsilon protection)
+    sharpe = means / (stds + 1e-9) 
+    
+    stability_report = pd.DataFrame({
+        'Mean_Gain': means,
+        'Std_Dev': stds,
+        'Sharpe_Ratio': sharpe
+    })
+    
+    print("\n--- CLUSTER STABILITY REPORT (Top Sharpe) ---")
+    print(stability_report.sort_values('Sharpe_Ratio', ascending=False).head(10))
+    
+    print("\n--- UNSTABLE CLUSTERS (High Volatility) ---")
+    print(stability_report.sort_values('Std_Dev', ascending=False).head(5))
+
+    # CRITICAL CHANGE: Return Sharpe Ratio for the Heatmap instead of Mean
+    return sharpe.to_dict()
 
 # ==============================================================================
 # EXECUTION LOOP
 # ==============================================================================
-def run_pipeline(X_input, y_input, threshold=0.5, n_splits=3, purge_size=24, verbose=True, save_dir=None):
+def run_pipeline(X_input, y_input, purge_size,  threshold=0.5, n_splits=3, verbose=True, save_dir=None):
     
     X_num = X_input.select_dtypes(include=[np.number])
     
@@ -273,7 +349,7 @@ def run_pipeline(X_input, y_input, threshold=0.5, n_splits=3, purge_size=24, ver
         scores = get_robust_clustered_mda(
             X_clean, 
             y_clean, 
-            feature_to_cluster_clean, 
+            feature_to_cluster=feature_to_cluster_clean,  # <--- Change this to match the definition's arg name, 
             n_splits=n_splits, 
             purge_size=purge_size
         )
@@ -288,11 +364,13 @@ def run_pipeline(X_input, y_input, threshold=0.5, n_splits=3, purge_size=24, ver
     df_mda = df_mda.sort_index()
     
     if verbose:
-        print("\n--- FINAL CLUSTER IMPORTANCE (Log Loss Decrease) ---")
+        print("\n--- FINAL CLUSTER IMPORTANCE (Sharpe Ratio) ---")
         print(df_mda)
 
-    # Check for "Dead" Clusters
+    # Sum of Sharpe Ratios across targets (Proxy for 'Global Stability')
     df_mda['Total_Importance'] = df_mda.sum(axis=1)
+    
+    # Dead = Sum of Sharpe <= 0 (Means on average it's unstable or harmful)
     dead_clusters = df_mda[df_mda['Total_Importance'] <= 0].index.tolist()
 
     return df_mda, dead_clusters
@@ -304,28 +382,37 @@ def visualize_cluster_importance(df_mda, dead_clusters, save_dir=None):
 
     fig, axes = plt.subplots(1, 2, figsize=(20, 8))
 
-    # --- PLOT A: HEATMAP ---
+    # --- PLOT A: HEATMAP (SHARPE) ---
     sns.heatmap(
         df_mda.drop(columns=['Total_Importance'], errors='ignore'), 
         annot=True,
-        fmt=".4f",
+        fmt=".2f", # 2 decimal places is enough for Sharpe
         cmap="RdYlGn",
-        center=0,
+        center=0.5, # Center at 0.5 (Transition from noise to signal)
+        vmin=-0.5,  # Cap min visual range
+        vmax=2.0,   # Cap max visual range (Sharpe > 2 is amazing)
         ax=axes[0],
-        cbar_kws={'label': 'Log Loss Decrease (Higher is Better)'}
+        cbar_kws={'label': 'Sharpe Ratio (Stability)'}
     )
-    axes[0].set_title('Cluster Importance by Target', fontsize=15)
+    axes[0].set_title('Cluster Stability (Sharpe Ratio) by Target', fontsize=15)
     axes[0].set_ylabel('Cluster ID')
     axes[0].set_xlabel('Target')
 
-    # --- PLOT B: RANKED BAR CHART ---
+    # --- PLOT B: RANKED BAR CHART (TOTAL SHARPE) ---
     total_importance = df_mda.drop(columns=['Total_Importance'], errors='ignore').sum(axis=1).sort_values(ascending=True)
-    colors = ['red' if x < 0 else 'forestgreen' for x in total_importance.values]
+    
+    # Color Logic: Red if < 0, Yellow if < 1.0 (Weak), Green if > 1.0 (Strong)
+    colors = []
+    for x in total_importance.values:
+        if x < 0: colors.append('red')
+        elif x < 1.0: colors.append('gold')
+        else: colors.append('forestgreen')
 
     total_importance.plot(kind='barh', ax=axes[1], color=colors, edgecolor='black')
-    axes[1].axvline(0, color='black', linewidth=1) 
-    axes[1].set_title('Overall Cluster Importance (Sum Across Targets)', fontsize=15)
-    axes[1].set_xlabel('Cumulative Log Loss Decrease')
+    axes[1].axvline(1.0, color='black', linestyle='--', linewidth=1, label="Significance Threshold (1.0)") 
+    axes[1].set_title('Overall Cluster Stability (Sum of Sharpes)', fontsize=15)
+    axes[1].set_xlabel('Cumulative Sharpe Ratio')
+    axes[1].legend()
 
     plt.tight_layout()
     
@@ -336,36 +423,31 @@ def visualize_cluster_importance(df_mda, dead_clusters, save_dir=None):
         plt.show()
 
     # ==============================================================================
-    # TEXT SUMMARY
+    # TEXT SUMMARY (SAFE MODE - NO EMOJIS)
     # ==============================================================================
     print("\n--- DECISION REPORT ---")
     best_cluster = total_importance.idxmax()
-    print(f"🏆 MVP Cluster: Cluster {best_cluster} (Highest Total Signal)")
+    print(f"MVP Cluster: Cluster {best_cluster} (Highest Stability)")
 
     negative_clusters = total_importance[total_importance < 0].index.tolist()
     if negative_clusters:
-        print(f"⚠️  Harmful Clusters (Negative Score - REMOVE THESE): {negative_clusters}")
+        print(f"HARMFUL Clusters (Sharpe < 0 - REMOVE): {negative_clusters}")
     else:
-        print("✅ No clusters were explicitly harmful (all > 0).")
+        print("No clusters were explicitly harmful (Sharpe > 0).")
 
-    useless_clusters = total_importance[(total_importance >= 0) & (total_importance < 1e-4)].index.tolist()
-    if useless_clusters:
-        print(f"💤 Weak/Noise Clusters (Near Zero Impact): {useless_clusters}")
+    # WEAK Logic: 0 <= Sharpe < 1.0
+    weak_clusters = total_importance[(total_importance >= 0) & (total_importance < 1.0)].index.tolist()
+    if weak_clusters:
+        print(f"WEAK/NOISE Clusters (0 < Sharpe < 1.0): {weak_clusters}")
+        print("   -> Tip: Keep these ONLY if they have very high Mean Gain in the Stability Report.")
 
-    if dead_clusters:
-        print(f"💀 Dead Clusters (Negative or Zero across all targets): {dead_clusters}")
-    else:
-        print("✅ No clusters were dead (all > 0 across all targets).")
+    strong_clusters = total_importance[total_importance >= 1.0].index.tolist()
+    if strong_clusters:
+         print(f"STRONG Clusters (Sharpe >= 1.0 - KEEP): {strong_clusters}")
 
 DEFAULT_TARGET_FILE_PATH = "./sample_data/btc_5min_targets.csv"
 DEFAULT_THRESHOLD_RUNS = [0.5, 0.7]
 
-def setup_directories(parent_dir, threshold):
-    """Creates a subdirectory for the specific threshold run."""
-    run_dir = os.path.join(parent_dir, f"run_threshold_{threshold}")
-    if not os.path.exists(run_dir):
-        os.makedirs(run_dir)
-    return run_dir
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run analysis on a dataframe split")
@@ -381,13 +463,17 @@ if __name__ == "__main__":
         help="List of thresholds (usage: --thresholds 0.3 0.5 0.7)"
     )
     parser.add_argument("--purge_size", default=24, type=int, help="Number of rows to purge during validation")
+    parser.add_argument("--num_folds", default=5, type=int, help="Number of folds for Walk-Forward Validation") # <--- ADDED
+
     args = parser.parse_args()
     
     # Define thresholds to iterate over
     thresholds = args.thresholds
     TARGET_FILE_PATH = args.target_path
     purge_size = args.purge_size
-
+    num_folds = args.num_folds # <--- CAPTURE
+    print(f"purge_size= {purge_size}")
+    print(f"num_folds= {num_folds}")
     # ---------------------------------------------
     # 1. SETUP BASE DIRECTORY
     # ---------------------------------------------
@@ -429,8 +515,9 @@ if __name__ == "__main__":
             df_mda, dead_clusters = run_pipeline(
                 df_final, 
                 targets, 
-                threshold=thresh, 
                 purge_size=purge_size,
+                threshold=thresh, 
+                n_splits=num_folds, # <--- PASS ARG
                 verbose=True, 
                 save_dir=run_dir # Pass dir to save dendrogram
             )
@@ -440,6 +527,7 @@ if __name__ == "__main__":
             
         except Exception as e:
             print(f"ERROR in run {thresh}: {e}")
+            raise # Re-raise to see the full trace if needed
         
         print(f"\nRun for threshold {thresh} completed. Results saved to {run_dir}")
         
